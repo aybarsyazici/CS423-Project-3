@@ -4,15 +4,7 @@ tqdm
 sentence-transformers
 pandarallel
 ipywidgets
-fuzzywuzzy 
-python-Levenshtein
-rapidfuzz
 networkx
 spacy
-wikipedia2vecg
 gensim
-jsonlines
-torch
-torchvision
-torchaudio
 termcolor

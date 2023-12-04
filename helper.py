@@ -122,7 +122,7 @@ def generate_candidates_with_page_rank(document, statements, item_aliases):
     return entity_candidates
 
 
-def get_anchor_info(file_path, wiki_items_joined):
+def get_anchor_info(file_path, wiki_items_joined=None):
 
     # check if anchor_target_counts.csv exists
     try:

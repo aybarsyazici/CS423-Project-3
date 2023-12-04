@@ -8,7 +8,7 @@ import helper
 from IPython.display import display
 import pickle
 import torch
-
+import numpy as np
 
 EXTRA_DATA_DIR = './data/extra/'
 
@@ -37,8 +37,11 @@ class EntityDataset(Dataset):
 
 
         self.logger.log(f'Loading {model_name} model & Generating sentence embeddings of {set_type} set...')
-        self.model = SentenceTransformer(model_name, device=device)
-        self.train_data = pd.read_csv(DATA_DIR + 'train_data_preprocessed.csv')
+        self.model = SentenceTransformer(model_name, device='cuda')
+        if train:
+            self.train_data = pd.read_csv(DATA_DIR + 'train_data_preprocessed.csv')
+        else:
+            self.train_data = pd.read_csv(DATA_DIR + 'test.csv')
         self.train_data['sentence_id'] = (self.train_data['token'] == '.').cumsum()
         self.not_nan = self.train_data['wiki_url'].notna()
         self.not_nme = self.train_data['wiki_url'] != '--NME--'
@@ -59,9 +62,7 @@ class EntityDataset(Dataset):
             
             # Append this list to the all_tokens list
             all_tokens.append(sentence_tokens)
-        self.all_tokens = all_tokens
-        all_tokens = [' '.join(tokens) for tokens in all_tokens]
-        self.sentence_embeddings = self.model.encode(all_tokens, show_progress_bar=True)
+        self.sentence_embeddings = self.model.encode([' '.join(tokens) for tokens in all_tokens], show_progress_bar=True)
 
 
         self.logger.log(f'Now generating entity embeddings...')
@@ -115,22 +116,29 @@ class EntityDataset(Dataset):
         
         
         self.logger.log(f'Generating DataFrame for candidate generation...')
-        pages = pd.read_csv(EXTRA_DATA_DIR + 'page.csv')
-        wiki_items_joined = wiki_items.merge(pages[['page_id', 'item_id', 'views']], on='item_id', how='left')
-        self.at_count_df = helper.get_anchor_info(f'{EXTRA_DATA_DIR}link_annotated_text.jsonl', wiki_items_joined)
-        self.at_count_df.set_index('normalized_anchor_text',inplace=True)
-        # now sort by p_target_given_anchor
-        self.at_count_df.sort_values(by=['p_target_given_anchor'], ascending=False, inplace=True)
-        self.at_count_df = self.at_count_df.groupby(level=0).head(5)
-        self.anchor_target_counts = helper.AnchorTargetStats(
-            self.at_count_df, helper.text_normalizer
-        )
-
-
+        with open(DATA_DIR + 'pkl/anchor_to_candidate.pkl', 'rb') as handle:
+            self.anchor_to_candidate = pickle.load(handle)
         self.logger.log(f'Generating Embedding for candidate descriptions...')
         # load from pickle
         with open(DATA_DIR + 'pkl/item_id_to_description_embedding.pkl', 'rb') as handle:
             self.item_id_to_description_embedding = pickle.load(handle)
+        
+        # delete all the unnecessary variables
+        del self.train_data
+        del self.not_nan
+        del self.not_nme
+        del not_nan
+        del not_nme
+        del all_tokens
+        del self.model
+        del wiki_items
+        del self.logger
+        del self.device
+        del train_data_no_doc_start
+
+        #del wiki_items_joined
+        #del pages
+        #del statements
 
 
     def __len__(self):
@@ -148,19 +156,21 @@ class EntityDataset(Dataset):
             entity_embed = self.entity_embeddings[index]
             full_mention = row['full_mention']
             # get candidate entities
-            candidates = self.at_count_df.loc[[full_mention.strip().lower()]].head(5)
-            candidate_ids = candidates['target_item_id'].to_list()
+            candidate_ids = self.anchor_to_candidate[full_mention.strip().lower()]
             candidate_description_embeddings = [self.item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
             # pad the candidate_description_embeddings and candidate_ids to length 5
             candidate_description_embeddings = candidate_description_embeddings + [torch.zeros(384)] * (5 - len(candidate_description_embeddings))
             # pad candidate_ids with 0s
             candidate_ids = candidate_ids + [0] * (5 - len(candidate_ids))
-            # get label
-            label = row['item_id']
+            # get label (which candidate_id equals the item_id, if none, return 0)
+            try:
+                label = candidate_ids.index(row['item_id'])
+            except:
+                label = 0
             return sentence_embed, entity_embed, candidate_ids, candidate_description_embeddings, label
         except Exception as e:
-            # return all zeros
-            return torch.zeros(384), torch.zeros(384), [0] * 5, [torch.zeros(384)] * 5, 0
+            # return all zeros using numpy
+            return np.zeros(384), np.zeros(384), [0] * 5, [np.zeros(384)] * 5, 0
     
     # collate_fn is optional, but allows us to do custom batching
     @staticmethod
@@ -187,4 +197,49 @@ class EntityDataset(Dataset):
         labels = torch.tensor(labels, dtype=torch.long, device=device)
 
         return sentence_embeddings, entity_embeddings, candidate_ids, candidate_description_embeddings, labels
+
+
+class EntityClassifier(torch.nn.Module):
+    def __init__(self, device='cuda'):
+        # This sequential layer will calculate a probability for each candidate entity, 
+        # Since we will have CrossEntropyLoss as our loss function, we don't need to apply softmax
+        # The input to this layer will be the concatenation of the sentence embedding, entity embedding, and candidate description embedding
+        # The output will be single number, since it will be the probability of the candidate entity being the correct entity
+        # We pass each candidate once and get the probability of it being the correct entity
+        # Select the one with the highest probability
+        super().__init__()
+        self.sequential = torch.nn.Sequential(
+            torch.nn.Linear(384 * 3, 384),
+            torch.nn.ReLU(),
+            torch.nn.Linear(384, 1)
+        )
+        self.device = device
+        self.to(device)
+
+    def forward(self, x):
+        sentence_embeddings, entity_embeddings, candidate_ids, candidate_description_embeddings = x
+        # The shapes are:
+        # sentence_embeddings: (batch_size, 384)
+        # entity_embeddings: (batch_size, 384)
+        # candidate_ids: (batch_size, 5)
+        # candidate_description_embeddings: (batch_size, 5, 384)
+        # labels: (batch_size,)
+        sentence_entity_embed = torch.cat((sentence_embeddings, entity_embeddings), dim=1).to(self.device)
+        # The shape of sentence_entity_embed is (batch_size, 384 * 2)
+
+        candidate_preds = torch.zeros(candidate_ids.shape[0], candidate_ids.shape[1], dtype=torch.float32, device=self.device)
+        for i in range(candidate_ids.shape[1]):
+            # Get the current candidate of all the batches
+            candidate_description_embed = candidate_description_embeddings[:,i,:]
+            # The shape of candidate_description_embed is (batch_size, 384)
+            # Concatenate the sentence_entity_embed and candidate_description_embed
+            candidate_embed = torch.cat((sentence_entity_embed, candidate_description_embed), dim=1)
+            # The shape of candidate_embed is (batch_size, 384 * 3)
+            # Pass it through the sequential layer
+            candidate_pred = self.sequential(candidate_embed)
+            # The shape of candidate_pred is (batch_size, 1)
+            # we squeeze to get into shape (batch_size,)
+            candidate_preds[:,i] = candidate_pred.squeeze()
+        return candidate_preds
+
         
