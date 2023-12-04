@@ -1,3 +1,9 @@
-data/
+data/*.csv
+data/extra/*.csv
+data/extra/*.jsonl
+data/pkl/*.csv
+data/pkl/*.zip
+data/pkl/*.pkl
+data/wiki_lite
 .venv/
 __pycache__/

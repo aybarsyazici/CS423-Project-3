@@ -126,7 +126,7 @@ def get_anchor_info(file_path, wiki_items_joined):
 
     # check if anchor_target_counts.csv exists
     try:
-        at_count_df = pd.read_csv("data/extra/anchor_target_counts.csv")
+        at_count_df = pd.read_csv("data/pkl/anchor_target_counts.csv")
         return at_count_df
     except:
         pass

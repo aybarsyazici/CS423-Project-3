@@ -129,7 +129,7 @@ class EntityDataset(Dataset):
 
         self.logger.log(f'Generating Embedding for candidate descriptions...')
         # load from pickle
-        with open(EXTRA_DATA_DIR + 'item_id_to_description_embedding.pkl', 'rb') as handle:
+        with open(DATA_DIR + 'pkl/item_id_to_description_embedding.pkl', 'rb') as handle:
             self.item_id_to_description_embedding = pickle.load(handle)
 
 
