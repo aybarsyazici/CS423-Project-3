@@ -4,6 +4,8 @@ data/extra/*.jsonl
 data/pkl/*.csv
 data/pkl/*.zip
 data/pkl/*.pkl
+data/pkl/*.pt
+data/pkl/*.jsonl
 data/wiki_lite
 .venv/
 __pycache__/

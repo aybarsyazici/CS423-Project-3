@@ -5,7 +5,7 @@ from collections import Counter
 import json
 import re
 import subprocess
-
+import pickle
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -125,28 +125,35 @@ def generate_candidates_with_page_rank(document, statements, item_aliases):
 def get_anchor_info(file_path, wiki_items_joined=None):
 
     # check if anchor_target_counts.csv exists
-    try:
-        at_count_df = pd.read_csv("data/pkl/anchor_target_counts.csv")
-        return at_count_df
-    except:
-        pass
+    # try:
+    #     at_count_df = pd.read_csv("data/pkl/anchor_target_counts.csv")
+    #     return at_count_df
+    # except:
+    #     pass
 
     klat = KdwdLinkAnnotatedText(file_path)
     anchor_target_counts = Counter()
-    for page in tqdm(
-        klat, 
-        total=NUM_KLAT_LINES, 
-        desc='calculating anchor-target counts'
-    ):
-        for section in page['sections']:
-            spans = [
-                (offset, offset + length) for offset, length in 
-                zip(section['link_offsets'], section['link_lengths'])]
-            anchor_texts = [section['text'][ii:ff] for ii,ff in spans]
-            keys = [
-                (anchor_text, target_page_id) for anchor_text, target_page_id in 
-                zip(anchor_texts, section['target_page_ids'])]
-            anchor_target_counts.update(keys)
+    # check if /data/pkl/achor_target_counts.pkl exists
+    
+    try:
+        with open("data/pkl/anchor_target_counts.pkl", "rb") as f:
+            anchor_target_counts = pickle.load(f)
+    except:
+        for page in tqdm(
+            klat, 
+            total=NUM_KLAT_LINES, 
+            desc='calculating anchor-target counts'
+        ):
+            for section in page['sections']:
+                spans = [
+                    (offset, offset + length) for offset, length in 
+                    zip(section['link_offsets'], section['link_lengths'])]
+                anchor_texts = [section['text'][ii:ff] for ii,ff in spans]
+                keys = [
+                    (anchor_text, target_page_id) for anchor_text, target_page_id in 
+                    zip(anchor_texts, section['target_page_ids'])]
+                anchor_target_counts.update(keys)
+    
 
     at_count_df = pd.DataFrame([
         (row[0][0], row[0][1], row[1]) for row in anchor_target_counts.most_common()],
@@ -163,6 +170,18 @@ def get_anchor_info(file_path, wiki_items_joined=None):
         sort_values('anchor_target_count', ascending=False).
         reset_index()                                                        
     )
+
+    if wiki_items_joined is None:
+        wiki_items = pd.read_csv("data/wiki_lite/wiki_items.csv")
+        pages = pd.read_csv("data/wiki_lite/page.csv")
+
+        wiki_items_joined = pd.merge(
+            wiki_items,
+            pages,
+            how="left",
+            left_on="item_id",
+            right_on="item_id"
+        )
 
     at_count_df = pd.merge(
         at_count_df,
