@@ -271,7 +271,7 @@ class EntityDataset(Dataset):
             else:
                 candidate_ids = []
             
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.7]
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.95]
 
             # drop duplicates
             candidate_ids = list(set(candidate_ids))
@@ -334,7 +334,7 @@ class EntityDataset(Dataset):
             else:
                 candidate_ids = []
 
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.7] 
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.95] 
 
             # drop duplicates
             candidate_ids = list(set(candidate_ids))
