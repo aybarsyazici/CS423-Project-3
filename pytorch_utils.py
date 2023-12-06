@@ -1,4 +1,5 @@
 # Torch Dataset definition
+from pydoc import doc
 from torch.utils.data import Dataset
 import pandas as pd
 from sentence_transformers import SentenceTransformer, util
@@ -13,6 +14,23 @@ import numpy as np
 DATA_DIR = './data/'
 EXTRA_DATA_DIR =  DATA_DIR + 'extra/'
 
+
+def update_full_mentions(df):
+    # Define a function to get the longest full_mention
+    def get_longest_mention(group):
+        return group.loc[group['full_mention'].str.len().idxmax()]
+
+    # Group by 'doc_id' and 'token', then apply the function
+    longest_mentions = df.groupby(['doc_id', 'token']).apply(get_longest_mention)
+
+    # Reset index to turn the group identifiers into columns
+    longest_mentions.reset_index(drop=True, inplace=True)
+
+    # Merge the longest mentions back into the original DataFrame
+    # This step will replace the full_mention in the original DataFrame
+    df = df.drop('full_mention', axis=1).merge(longest_mentions[['doc_id', 'token', 'full_mention']], on=['doc_id', 'token'], how='left')
+
+    return df
 
 class Logger:
     def __init__(self, output=True):
@@ -31,9 +49,19 @@ logger.log('Loading anchor candidate data...')
 with open(DATA_DIR + 'pkl/anchor_to_candidate_new.pkl', 'rb') as handle:
     anchor_to_candidate = pickle.load(handle)
 
+logger.log('Loading item_id to statement embedding data...')
+# with open(DATA_DIR + 'pkl/item_id_to_description_embedding.pkl', 'rb') as handle:
+#     item_id_to_description_embedding = pickle.load(handle)
+with open(DATA_DIR + 'pkl/statement_embeddings.pkl', 'rb') as handle:
+    statement_embeddings = pickle.load(handle)
+with open(DATA_DIR + 'pkl/statements_item_id_to_row.pkl', 'rb') as handle:
+    statement_item_id_to_row = pickle.load(handle)
+
 logger.log('Loading item_id to description embedding data...')
-with open(DATA_DIR + 'pkl/item_id_to_description_embedding.pkl', 'rb') as handle:
-    item_id_to_description_embedding = pickle.load(handle)
+with open(DATA_DIR + 'pkl/title_description_embeddings.pkl', 'rb') as handle:
+    description_embeddings = pickle.load(handle)
+with open(DATA_DIR + 'pkl/title_description_embeddings_item_id_to_row_id.pkl', 'rb') as handle:
+    description_item_id_to_row = pickle.load(handle)
 
 logger.log('Loading wikipedia title embedings...')
 with open(DATA_DIR + 'pkl/corpus_embeddings.pt', 'rb') as handle:
@@ -66,6 +94,8 @@ class EntityDataset(Dataset):
         self.train_data['doc_id'] = self.train_data['token'].str.startswith('-DOCSTART-').cumsum()
         self.not_nan = self.train_data['wiki_url'].notna()
         self.not_nme = self.train_data['wiki_url'] != '--NME--'
+        self.train_data['full_mention'] = self.train_data['full_mention'].fillna('')
+        self.train_data = update_full_mentions(self.train_data)
         self.entity_df = self.train_data[self.not_nan & self.not_nme]
         train_data_no_doc_start = self.train_data[self.train_data['token'].str.startswith('-DOCSTART-') == False]
         # create sentence-id column by cumsumming the number of tokens that are == '.'
@@ -185,36 +215,36 @@ class EntityDataset(Dataset):
 
 
 
-    def __getitemold__(self, index):
-        row = self.entity_df.iloc[index]
-        # get sentence_id
-        sentence_id = row['sentence_id']
-        # get sentence embedding
-        sentence_embed = self.sentence_embeddings[sentence_id]
-        # get entity embedding
-        entity_embed = self.entity_embeddings[index]
-        full_mention = row['full_mention']
-        # get candidate entities from anchor
-        if full_mention.strip().lower() in anchor_to_candidate:
-            candidate_ids = anchor_to_candidate[full_mention.strip().lower()]
-        else:
-            candidate_ids = []
-        # get the candidates
-        # syntax_candidate_ids = util.semantic_search(entity_embed, corpus_embeddings, top_k=3, score_function=util.dot_score)[0]
-        # candidate_ids = candidate_ids + [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids]
-        # drop duplicates
-        # candidate_ids = list(set(candidate_ids))
-        candidate_description_embeddings = [item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
-        # pad the candidate_description_embeddings and candidate_ids to length 8
-        candidate_description_embeddings = candidate_description_embeddings + [np.zeros(384)] * (5 - len(candidate_description_embeddings))
-        # pad candidate_ids with 0s
-        candidate_ids = candidate_ids + [0] * (5 - len(candidate_ids))
-        # get label (which candidate_id equals the item_id, if none, return 0)
-        try:
-            label = candidate_ids.index(row['item_id'])
-        except:
-            label = 0
-        return sentence_embed, entity_embed, candidate_ids, np.array(candidate_description_embeddings), label
+    # def __getitemold__(self, index):
+    #     row = self.entity_df.iloc[index]
+    #     # get sentence_id
+    #     sentence_id = row['sentence_id']
+    #     # get sentence embedding
+    #     sentence_embed = self.sentence_embeddings[sentence_id]
+    #     # get entity embedding
+    #     entity_embed = self.entity_embeddings[index]
+    #     full_mention = row['full_mention']
+    #     # get candidate entities from anchor
+    #     if full_mention.strip().lower() in anchor_to_candidate:
+    #         candidate_ids = anchor_to_candidate[full_mention.strip().lower()]
+    #     else:
+    #         candidate_ids = []
+    #     # get the candidates
+    #     # syntax_candidate_ids = util.semantic_search(entity_embed, corpus_embeddings, top_k=3, score_function=util.dot_score)[0]
+    #     # candidate_ids = candidate_ids + [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids]
+    #     # drop duplicates
+    #     # candidate_ids = list(set(candidate_ids))
+    #     candidate_description_embeddings = [item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
+    #     # pad the candidate_description_embeddings and candidate_ids to length 8
+    #     candidate_description_embeddings = candidate_description_embeddings + [np.zeros(384)] * (5 - len(candidate_description_embeddings))
+    #     # pad candidate_ids with 0s
+    #     candidate_ids = candidate_ids + [0] * (5 - len(candidate_ids))
+    #     # get label (which candidate_id equals the item_id, if none, return 0)
+    #     try:
+    #         label = candidate_ids.index(row['item_id'])
+    #     except:
+    #         label = 0
+    #     return sentence_embed, entity_embed, candidate_ids, np.array(candidate_description_embeddings), label
         
     @staticmethod
     def collate_fn_train(batch, device='cuda'):
@@ -222,8 +252,8 @@ class EntityDataset(Dataset):
         document_embed, sentence_embeddings, entity_embeddings, full_mentions, item_ids = zip(*batch)
 
         # Convert to torch tensors
-        # document_embed = torch.tensor(document_embed, dtype=torch.float32, device=device)
-        document_embed = document_embed.to(device)
+        document_embed = torch.tensor(document_embed, dtype=torch.float32, device=device)
+        # document_embed = document_embed.to(device)
         sentence_embeddings = torch.tensor(sentence_embeddings, dtype=torch.float32, device=device)
         entity_embeddings = torch.tensor(entity_embeddings, dtype=torch.float32, device=device)
 
@@ -234,19 +264,19 @@ class EntityDataset(Dataset):
         candidate_ids_batch = []
         candidate_description_embeddings_batch = []
         labels = []
-
+        valid_sample_indices = []
         for i, (full_mention, item_id, syntax_candidate_ids) in enumerate(zip(full_mentions, item_ids, syntax_candidate_ids_batch)):
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
-
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids  if candidate_id['score'] >= 0.95]
+            
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.7]
 
             # drop duplicates
             candidate_ids = list(set(candidate_ids))
 
-            candidate_description_embeddings = [item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
+            candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
 
             # pad the candidate_description_embeddings and candidate_ids to length 8
             candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
@@ -254,9 +284,9 @@ class EntityDataset(Dataset):
             # pad candidate_ids with 0s
             candidate_ids += [0] * (8 - len(candidate_ids))
 
-
             try:
                 label = candidate_ids.index(item_id)
+                valid_sample_indices.append(i)
             except:
                 label = 0
 
@@ -264,10 +294,20 @@ class EntityDataset(Dataset):
             candidate_description_embeddings_batch.append(candidate_description_embeddings)
             labels.append(label)
 
+        # Filter the batch data based on valid_sample_indices
+        document_embed = document_embed[valid_sample_indices]
+        sentence_embeddings = sentence_embeddings[valid_sample_indices]
+        entity_embeddings = entity_embeddings[valid_sample_indices]
+        # print(f'{document_embed.shape}, {sentence_embeddings.shape}, {entity_embeddings.shape}')
+        candidate_ids_batch = [candidate_ids_batch[i] for i in valid_sample_indices]
+        candidate_description_embeddings_batch = [candidate_description_embeddings_batch[i] for i in valid_sample_indices]
+        labels = [labels[i] for i in valid_sample_indices]
+
         # convert to torch tensors
         candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
         candidate_description_embeddings_batch = torch.tensor(candidate_description_embeddings_batch, dtype=torch.float32, device=device)
         labels = torch.tensor(labels, dtype=torch.long, device=device)
+        # print(f'{candidate_ids_batch.shape}, {candidate_description_embeddings_batch.shape}, {labels.shape}')
 
         return document_embed, sentence_embeddings, entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch, labels
 
@@ -294,12 +334,12 @@ class EntityDataset(Dataset):
             else:
                 candidate_ids = []
 
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] >= 0.95]
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.7] 
 
             # drop duplicates
             candidate_ids = list(set(candidate_ids))
 
-            candidate_description_embeddings = [item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
+            candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
 
             # pad the candidate_description_embeddings and candidate_ids to length 8
             candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))

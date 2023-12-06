@@ -124,6 +124,20 @@ def generate_candidates_with_page_rank(document, statements, item_aliases):
 
 def get_anchor_info(file_path, wiki_items_joined=None):
 
+    """
+        This function generates a dataframe that gives us the information about:
+        anchor_text, target_page, p(target|anchor), p(anchor|target)
+
+        From this dataframe we generate anchor_to_candidate.pkl which is used to get candidates given
+        an anchor text.
+
+        To run this you need the link_annotated_text.jsonl from Kensho Derived Wikimedia Dataset
+        and give the file path to it.
+
+        You also need to join the wiki_items.csv and page.csv from wiki_lite to get the page views.
+        If you don't give the dataframe as a parameter, it will be loaded from the csv files.
+    """
+
     # check if anchor_target_counts.csv exists
     # try:
     #     at_count_df = pd.read_csv("data/pkl/anchor_target_counts.csv")
