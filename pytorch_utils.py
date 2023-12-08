@@ -10,17 +10,21 @@ from IPython.display import display
 import pickle
 import torch
 import numpy as np
-from transformers import BertTokenizer, BertModel
+from transformers import DistilBertTokenizer, DistilBertModel
 import os
 from torch.nn.utils.rnn import pad_sequence
 
 DATA_DIR = './data/'
 EXTRA_DATA_DIR =  DATA_DIR + 'extra/'
 
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-SPECIAL_TOKENS = {"candidate_token": "[CANDIDATE]", "context_token": "[CONTEXT]", "mention_token": "[MENTION]"}
+tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+SPECIAL_TOKENS = {
+    "candidate_token": "<candidate>", 
+    "context_token": "<context>", 
+    "mention_token": "<mention>"
+}
 # Add special tokens to tokenizer
-tokenizer.add_tokens(list(SPECIAL_TOKENS.values()))
+tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.values())})
 
 def update_full_mentions(df):
     # Define a function to get the longest full_mention
@@ -178,152 +182,84 @@ class EntityDataset(Dataset):
             return context, index, full_mention
         
     @staticmethod
-    def collate_fn_train(batch, entity_embed_tensor, device='cuda'):
-        # Unpack the batch data
-        contexts, indexes, full_mentions, item_ids = zip(*batch)
-        entity_embeddings = entity_embed_tensor[indexes, :]
-        # move entity_embeddings to device
-        
-
-        context_texts = [SPECIAL_TOKENS['context_token'] + " " + context for context in contexts]
-        # Tokenize the context texts
-        contexts_tokenized = tokenizer(context_texts, padding=True, truncation=True, return_tensors='pt')
-
-        full_mention_texts = [SPECIAL_TOKENS['mention_token'] + " " + full_mention for full_mention in full_mentions]
-        # Tokenize the full_mention texts
-        full_mentions_tokenized = tokenizer(full_mention_texts, padding=True, truncation=True, return_tensors='pt')
-
-        syntax_candidate_ids_batch = util.semantic_search(entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
-        valid_ids = []
-        candidates_input_ids = []
-        candidates_attention_mask = []
-        candidates_token_type_ids = []
+    def collate_fn_train(batch, syntax_candidates_list, device='cuda'):
+        inputs = []
         labels = []
-        for i, (full_mention, syntax_candidate_ids, label) in enumerate(zip(full_mentions, syntax_candidate_ids_batch, item_ids)):
+        for i, data in enumerate(batch):
+            context, index, full_mention, item_id = data
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
 
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids] 
+            syntax_candidates = syntax_candidates_list[index]
 
-            # drop duplicates
-            candidate_ids = list(set(candidate_ids))
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates]
 
-            candidate_texts = [SPECIAL_TOKENS["candidate_token"] + " " + id_to_description[candidate_id]['description'] for candidate_id in candidate_ids]
+            # Remove duplicates and limit to 8 candidates
+            candidate_ids = list(set(candidate_ids))[:8]
 
-            # Tokenize the candidate texts
-            candidate_tokenized = tokenizer(candidate_texts, padding='max_length', truncation=True, return_tensors='pt', max_length=512)
-            # Padding candidates to ensure same number of candidates in each batch
-            pad_size = 8 - candidate_tokenized.input_ids.size(0)
-            if pad_size > 0:
-                padded_ids = torch.full((pad_size, candidate_tokenized.input_ids.size(1)), tokenizer.pad_token_id, dtype=torch.long)
-                candidate_tokenized.input_ids = torch.cat([candidate_tokenized.input_ids, padded_ids], dim=0)
-
-                padded_mask = torch.full((pad_size, candidate_tokenized.attention_mask.size(1)), 0, dtype=torch.long)
-                candidate_tokenized.attention_mask = torch.cat([candidate_tokenized.attention_mask, padded_mask], dim=0)
-
-                # Pad token_type_ids if they exist
-                if 'token_type_ids' in candidate_tokenized:
-                    padded_token_type_ids = torch.full((pad_size, candidate_tokenized.token_type_ids.size(1)), 0, dtype=torch.long)
-                    candidate_tokenized.token_type_ids = torch.cat([candidate_tokenized.token_type_ids, padded_token_type_ids], dim=0)
-            candidates_input_ids.append(candidate_tokenized.input_ids)
-            candidates_attention_mask.append(candidate_tokenized.attention_mask)
-            candidates_token_type_ids.append(candidate_tokenized.token_type_ids)
-
-
-            # Check if label is in candidate_ids
+            # do we have the ground truth in candidate_ids?
             try:
-                label_index = candidate_ids.index(label)
-                valid_ids.append(i)
+                label = candidate_ids.index(item_id)
             except ValueError:
-                label_index = 0
-            
-            labels.append(label_index)
+                # skip this sample
+                continue
 
-        # Only keep valid ids
-        candidates_input_ids = torch.stack(candidates_input_ids, dim=0)[valid_ids]
-        candidates_attention_mask = torch.stack(candidates_attention_mask, dim=0)[valid_ids]
-        candidates_token_type_ids = torch.stack(candidates_token_type_ids, dim=0)[valid_ids]
+            # Concatenate all candidate texts, separated by [SEP]
+            candidate_texts = " ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
 
-        contexts_input_ids = contexts_tokenized.input_ids[valid_ids]
-        contexts_attention_mask = contexts_tokenized.attention_mask[valid_ids]
-        contexts_token_type_ids = contexts_tokenized.token_type_ids[valid_ids]
+            # Pad with empty candidates if less than 8
+            for _ in range(8 - len(candidate_ids)):
+                candidate_texts += f" {SPECIAL_TOKENS['candidate_token']} [PAD]"
 
-        full_mentions_input_ids = full_mentions_tokenized.input_ids[valid_ids]
-        full_mentions_attention_mask = full_mentions_tokenized.attention_mask[valid_ids]
-        full_mentions_token_type_ids = full_mentions_tokenized.token_type_ids[valid_ids]
+            # Concatenate context, mention, and all candidate texts
+            input_text = f"{SPECIAL_TOKENS['context_token']} {context} {SPECIAL_TOKENS['mention_token']} {full_mention} {candidate_texts}"
+            inputs.append(input_text)
+            labels.append(label)
 
-        labels = [labels[i] for i in valid_ids]
+        # Tokenize all inputs
+        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+
         # Convert labels to tensor
         labels = torch.tensor(labels, dtype=torch.long, device=device)
 
-        # Move the rest to device
-        candidates_input_ids = candidates_input_ids.to(device)
-        candidates_attention_mask = candidates_attention_mask.to(device)
-        candidates_token_type_ids = candidates_token_type_ids.to(device)
+        # Move tokenized inputs to device
+        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
+        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
+        # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
 
-        contexts_input_ids = contexts_input_ids.to(device)
-        contexts_attention_mask = contexts_attention_mask.to(device)
-        contexts_token_type_ids = contexts_token_type_ids.to(device)
+        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, labels
 
-        full_mentions_input_ids = full_mentions_input_ids.to(device)
-        full_mentions_attention_mask = full_mentions_attention_mask.to(device)
-        full_mentions_token_type_ids = full_mentions_token_type_ids.to(device)
-        
-        return candidates_input_ids, candidates_attention_mask, candidates_token_type_ids, contexts_input_ids, contexts_attention_mask, contexts_token_type_ids, full_mentions_input_ids, full_mentions_attention_mask, full_mentions_token_type_ids, labels
+
 
 class EntityClassifier(torch.nn.Module):
     def __init__(self, transformer_model, hidden_size, num_candidates=8, device='cuda'):
         super().__init__()
-        self.transformer = BertModel.from_pretrained(transformer_model)
+        self.transformer = DistilBertModel.from_pretrained(transformer_model)
         self.transformer.resize_token_embeddings(len(tokenizer))
         self.classifier = torch.nn.Sequential(
-            torch.nn.Linear(self.transformer.config.hidden_size * 3, hidden_size),
+            torch.nn.Linear(self.transformer.config.hidden_size, hidden_size),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.3),
-            torch.nn.Linear(hidden_size, 1)  # Output is a score for each candidate
+            torch.nn.Linear(hidden_size, num_candidates)  # Output is a score for each candidate
         )
         self.num_candidates = num_candidates
         self.device = device
         self.to(device)
 
-    def forward(self, candidates_input_ids, candidates_attention_mask, candidates_token_type_ids, contexts_input_ids, contexts_attention_mask, contexts_token_type_ids, full_mentions_input_ids, full_mentions_attention_mask, full_mentions_token_type_ids):
+    def forward(self, tokenized_inputs_input_ids, tokenized_inputs_attention_mask, tokenized_inputs_token_type_ids):
         # Generate embeddings
-        context_embeds = self.transformer(
-            input_ids=contexts_input_ids,
-            attention_mask=contexts_attention_mask,
-            token_type_ids=contexts_token_type_ids
+        embeds = self.transformer(
+            input_ids=tokenized_inputs_input_ids,
+            attention_mask=tokenized_inputs_attention_mask,
         ).last_hidden_state.mean(dim=1)
-        mention_embeds = self.transformer(
-            input_ids=full_mentions_input_ids,
-            attention_mask=full_mentions_attention_mask,
-            token_type_ids=full_mentions_token_type_ids
-        ).last_hidden_state.mean(dim=1)
-        # Concatenate embeddings
-        combined_embeds = torch.cat((context_embeds, mention_embeds), dim=1) # (batch_size, 2 * hidden_size)
 
-        # Prepare for storing candidate scores
-        candidate_scores = torch.zeros(contexts_input_ids.size(0), self.num_candidates, device=self.device)
-        # Loop over each candidate
+        # Classify
+        logits = self.classifier(embeds)
+        # logits shape: (batch_size, num_candidates)
 
-        # candidate_input_ids: (batch_size, num_candidates, max_length)
-        # candidate_attention_mask: (batch_size, num_candidates, max_length)
-        # candidate_token_type_ids: (batch_size, num_candidates, max_length)
-        # If we do: candidates_input_ids[:, i], we get the i-th candidate of each sample in the batch, shape: (batch_size, max_length)
-        for i in range(self.num_candidates):
-            # Extract embeddings for the i-th candidate of each sample
-            candidate_embeds = self.transformer(
-                input_ids=candidates_input_ids[:, i],
-                attention_mask=candidates_attention_mask[:, i],
-                token_type_ids=candidates_token_type_ids[:, i]
-            ).last_hidden_state.mean(dim=1)
-
-            # Concatenate embeddings and pass through classifier
-            candidate_combined_embed = torch.cat((candidate_embeds, combined_embeds), dim=1) # shape: (batch_size, 3 * hidden_size)
-            classifier_out = self.classifier(candidate_combined_embed)
-            candidate_scores[:, i] = classifier_out.squeeze() # we do squeeze because the output is (batch_size, 1), but we want (batch_size)
-        return candidate_scores
+        return logits
         
 def delete_corpus_embeds():
     global corpus_embeddings
