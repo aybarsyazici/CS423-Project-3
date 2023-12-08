@@ -9,3 +9,4 @@ data/pkl/*.jsonl
 data/wiki_lite
 .venv/
 __pycache__/
+anchor_target_counts.csv
