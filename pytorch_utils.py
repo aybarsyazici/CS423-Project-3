@@ -223,6 +223,9 @@ class EntityDataset(Dataset):
         batch_entity_embeddings = torch.stack(batch_entity_embeddings)
         # candidate_ids_batch is a list of lists, convert it to a tensor
         candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
+        # first convert candidate_description_embeddings_batch to a numpy array
+        candidate_description_embeddings_batch = np.array(candidate_description_embeddings_batch)
+        # then convert it to a tensor
         candidate_description_embeddings_batch = torch.tensor(candidate_description_embeddings_batch, dtype=torch.float32, device=device)
 
         # move everything to device
