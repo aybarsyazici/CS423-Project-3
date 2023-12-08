@@ -10,6 +10,7 @@ from IPython.display import display
 import pickle
 import torch
 import numpy as np
+import os
 
 DATA_DIR = './data/'
 EXTRA_DATA_DIR =  DATA_DIR + 'extra/'
@@ -65,8 +66,7 @@ with open(DATA_DIR + 'pkl/title_description_embeddings_item_id_to_row_id.pkl', '
 
 logger.log('Loading wikipedia title embedings...')
 with open(DATA_DIR + 'pkl/corpus_embeddings.pt', 'rb') as handle:
-    corpus_embeddings = torch.load(handle)
-    corpus_embeddings = corpus_embeddings.to('cuda')
+    corpus_embeddings = torch.load(handle, map_location=torch.device('cuda'))
 
 logger.log('Loading wikipedia items...')
 wiki_items = pd.read_csv(DATA_DIR + 'wiki_lite/wiki_items.csv')
@@ -81,10 +81,11 @@ class EntityDataSample:
 
 class EntityDataset(Dataset):
     def __init__(self, train=True, model_name = 'all-MiniLM-L6-v2', device='cuda', DATA_DIR = './data/'):
+        global corpus_embeddings
         self.device = device
         self.train = train
         set_type = 'train' if train else 'test'
-        logger.log(f'Loading {model_name} model & Generating sentence embeddings of {set_type} set...')
+        logger.log(f'Loading {set_type} set...')
         self.model = SentenceTransformer(model_name, device='cuda')
         if train:
             self.train_data = pd.read_csv(DATA_DIR + 'train_data_preprocessed.csv')
@@ -92,94 +93,59 @@ class EntityDataset(Dataset):
             self.train_data = pd.read_csv(DATA_DIR + 'test.csv')
         self.train_data['sentence_id'] = (self.train_data['token'] == '.').cumsum()
         self.train_data['doc_id'] = self.train_data['token'].str.startswith('-DOCSTART-').cumsum()
-        self.not_nan = self.train_data['wiki_url'].notna()
-        self.not_nme = self.train_data['wiki_url'] != '--NME--'
         self.train_data['full_mention'] = self.train_data['full_mention'].fillna('')
         self.train_data = update_full_mentions(self.train_data)
-        self.entity_df = self.train_data[self.not_nan & self.not_nme]
-        train_data_no_doc_start = self.train_data[self.train_data['token'].str.startswith('-DOCSTART-') == False]
-        # create sentence-id column by cumsumming the number of tokens that are == '.'
-        all_tokens = []
-        # Iterate through each document
-        for sentence_id in tqdm(train_data_no_doc_start['sentence_id'].unique()):
-            # Filter the DataFrame for the current document
-            sentence_data = train_data_no_doc_start[train_data_no_doc_start['sentence_id'] == sentence_id]
-            
-            # remove tokens with NaN values
-            sentence_data = sentence_data[sentence_data['token'].notna()]
+        # Create a column called entity_loc that contains the location of the entity in the DOCUMENT
+        # This is basically the word offset from the start of the document, to do this we can create a column that has
+        # the row_id which resets for each document
+        self.train_data_no_doc_start = self.train_data[self.train_data['token'].str.startswith('-DOCSTART-') == False]
+        logger.log(f'Now generating context embeddings...')
+        file_name_to_load = 'train_context_text_150.pkl' if train else 'test_context_text_150.pkl'
+        exists = False
+        # does it exist under data/pkl ?
+        if os.path.exists(DATA_DIR + 'pkl/' + file_name_to_load):
+            logger.log(f'Loading {file_name_to_load} from data/pkl...')
+            with open(DATA_DIR + 'pkl/' + file_name_to_load, 'rb') as handle:
+                self.context_text = pickle.load(handle)
+            exists = True
+        if not exists:
+            self.train_data_no_doc_start['entity_loc'] = self.train_data_no_doc_start.groupby(['doc_id']).cumcount()
+        self.not_nan = self.train_data_no_doc_start['wiki_url'].notna()
+        self.not_nme = self.train_data_no_doc_start['wiki_url'] != '--NME--'
+        self.entity_df = self.train_data_no_doc_start[self.not_nan & self.not_nme]
+        # now for each entity in entity_df, create a context window, of total length 300, from both sides
+        # save this to an array so that we retrieve it in __getitem__
+        if not exists:
+            self.context_text = []
+            for i, row in tqdm(self.entity_df.iterrows(), total=self.entity_df.shape[0]):
+                doc_id = int(row['doc_id'])
+                # get the whole document
+                document = self.train_data_no_doc_start[self.train_data_no_doc_start['doc_id'] == doc_id]['token'].tolist()
+                # get the entity location
+                entity_loc = int(row['entity_loc'])
+                # get the context window
+                # First try to get 150 tokens before the entity
+                context = document[max(0, entity_loc - 75):entity_loc]
+                # Now try to get until 300 from the right, note the document might be shorter than 300
+                context += document[entity_loc:entity_loc + 150 - len(context)]
+                self.context_text.append(' '.join(context))
+            # save to filename
+            logger.log(f'Saving {file_name_to_load} to data/pkl...')
+            with open(DATA_DIR + 'pkl/' + file_name_to_load, 'wb') as handle:
+                pickle.dump(self.context_text, handle, protocol=pickle.HIGHEST_PROTOCOL)
 
-            # Extract the token column and convert it to a list
-            sentence_tokens = sentence_data['token'].tolist()
-            
-            # Append this list to the all_tokens list
-            all_tokens.append(sentence_tokens)
-        self.sentence_embeddings = self.model.encode([' '.join(tokens) for tokens in all_tokens], show_progress_bar=True)
-
-        logger.log(f'Now generating Doc embeddings...')
-        all_documents = []
-        for doc_id in tqdm(train_data_no_doc_start['doc_id'].unique()):
-            # Filter the DataFrame for the current document
-            doc_data = train_data_no_doc_start[train_data_no_doc_start['doc_id'] == doc_id]
-            
-            # remove tokens with NaN values
-            doc_data = doc_data[doc_data['token'].notna()]
-
-            # Extract the token column and convert it to a list
-            doc_tokens = doc_data['token'].tolist()
-            
-            # Append this list to the all_tokens list
-            all_documents.append(doc_tokens)
-        self.document_embeddings = self.model.encode([' '.join(tokens) for tokens in all_documents], show_progress_bar=True)
+        self.context_embeddings = self.model.encode(self.context_text, show_progress_bar=True, convert_to_tensor=True)
 
         logger.log(f'Now generating entity embeddings...')
         not_nan = self.train_data['wiki_url'].notna()
         not_nme = self.train_data['wiki_url'] != '--NME--'
-        self.entity_embeddings = self.model.encode(self.train_data[not_nan & not_nme]['full_mention'].to_list(), show_progress_bar=True)
-
-        if False:
-            logger.log(f'Now loading statements and properties.')
-            statements = pd.read_csv(DATA_DIR + 'wiki_lite/statements.csv')
-            properties = pd.read_csv(DATA_DIR + 'wiki_lite/property.csv')
-            relevant_statements = pd.merge(
-                statements,
-                properties,
-                how="left",
-                left_on="edge_property_id",
-                right_on="property_id"
-            )
-            # rename en_description to property_description
-            relevant_statements = relevant_statements.rename(columns={'en_description': 'property_description'})
-            relevant_statements = relevant_statements[['source_item_id', 'property_id', 'property_description', 'target_item_id']]
-            # join on wiki_items on source_item_id and target_item_id to get source_item_description and target_item_description
-            relevant_statements = pd.merge(
-                relevant_statements,
-                wiki_items,
-                how="left",
-                left_on="source_item_id",
-                right_on="item_id"
-            )
-            # rename description to source_item_description
-            relevant_statements.rename(columns={'en_description': 'source_item_description', 'en_label': 'source_label'}, inplace=True)
-            relevant_statements = relevant_statements[['source_item_id', 'source_label', 'source_item_description', 'property_id', 'property_description', 'target_item_id']]
-            relevant_statements = pd.merge(
-                relevant_statements,
-                wiki_items,
-                how="left",
-                left_on="target_item_id",
-                right_on="item_id"
-            )
-            # rename description to target_item_description
-            relevant_statements.rename(columns={'en_description': 'target_item_description', 'en_label': 'target_label'}, inplace=True)
-            relevant_statements = relevant_statements[['source_item_id', 'source_label', 'source_item_description', 'property_id', 'property_description', 'target_item_id', 'target_label', 'target_item_description']]
-            # reset_index to create a new column called row_num
-            relevant_statements = relevant_statements.reset_index()
-            # rename index column to row_num
-            self.relevant_statements = relevant_statements.rename(columns={'index': 'row_num'}, inplace=False)
-            # drop NaN rows
-            self.relevant_statements = self.relevant_statements.dropna()
-            #self.relevant_statements['statement'] = relevant_statements['source_label'] + '('+relevant_statements['source_item_description']+')' + ' ' + relevant_statements['property_description'] + ' ' + relevant_statements['target_label'] + '('+relevant_statements['target_item_description']+')'
-        
-        
+        self.entity_embeddings = self.model.encode(self.train_data[not_nan & not_nme]['full_mention'].to_list(), show_progress_bar=True, convert_to_tensor=True)
+        self.entity_embeddings = self.entity_embeddings.to(device)
+        print(f'Entity Length: {len(self.entity_embeddings)}')
+        print(f'Entity shape: {self.entity_embeddings.shape}')
+        logger.log(f'Now calculating syntactic neighbours...')
+        self.syntax_candidates = util.semantic_search(self.entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
+        self.entity_embeddings = self.entity_embeddings.to('cpu')
 
         
         # delete all the unnecessary variables
@@ -189,8 +155,6 @@ class EntityDataset(Dataset):
         del self.model
         del not_nan
         del not_nme
-        del all_tokens
-        del train_data_no_doc_start
 
         #del wiki_items_joined
         #del pages
@@ -203,158 +167,119 @@ class EntityDataset(Dataset):
     
     def __getitem__(self, index):
         row = self.entity_df.iloc[index]
-        sentence_id = row['sentence_id']
-        document_embed = self.document_embeddings[int(row['doc_id'])-1]
-        sentence_embed = self.sentence_embeddings[sentence_id]
-        entity_embed = self.entity_embeddings[index]
         full_mention = row['full_mention'].strip().lower()
         if self.train:
-            return document_embed, sentence_embed, entity_embed, full_mention, row['item_id']
+            return index, full_mention, row['item_id']
         else:
-            return document_embed, sentence_embed, entity_embed, full_mention
+            return index, full_mention
 
-
-
-    # def __getitemold__(self, index):
-    #     row = self.entity_df.iloc[index]
-    #     # get sentence_id
-    #     sentence_id = row['sentence_id']
-    #     # get sentence embedding
-    #     sentence_embed = self.sentence_embeddings[sentence_id]
-    #     # get entity embedding
-    #     entity_embed = self.entity_embeddings[index]
-    #     full_mention = row['full_mention']
-    #     # get candidate entities from anchor
-    #     if full_mention.strip().lower() in anchor_to_candidate:
-    #         candidate_ids = anchor_to_candidate[full_mention.strip().lower()]
-    #     else:
-    #         candidate_ids = []
-    #     # get the candidates
-    #     # syntax_candidate_ids = util.semantic_search(entity_embed, corpus_embeddings, top_k=3, score_function=util.dot_score)[0]
-    #     # candidate_ids = candidate_ids + [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids]
-    #     # drop duplicates
-    #     # candidate_ids = list(set(candidate_ids))
-    #     candidate_description_embeddings = [item_id_to_description_embedding[candidate_id][1] for candidate_id in candidate_ids]
-    #     # pad the candidate_description_embeddings and candidate_ids to length 8
-    #     candidate_description_embeddings = candidate_description_embeddings + [np.zeros(384)] * (5 - len(candidate_description_embeddings))
-    #     # pad candidate_ids with 0s
-    #     candidate_ids = candidate_ids + [0] * (5 - len(candidate_ids))
-    #     # get label (which candidate_id equals the item_id, if none, return 0)
-    #     try:
-    #         label = candidate_ids.index(row['item_id'])
-    #     except:
-    #         label = 0
-    #     return sentence_embed, entity_embed, candidate_ids, np.array(candidate_description_embeddings), label
         
     @staticmethod
-    def collate_fn_train(batch, device='cuda'):
-        # Unpack the batch data
-        document_embed, sentence_embeddings, entity_embeddings, full_mentions, item_ids = zip(*batch)
-
-        # Convert to torch tensors
-        document_embed = torch.tensor(document_embed, dtype=torch.float32, device=device)
-        # document_embed = document_embed.to(device)
-        sentence_embeddings = torch.tensor(sentence_embeddings, dtype=torch.float32, device=device)
-        entity_embeddings = torch.tensor(entity_embeddings, dtype=torch.float32, device=device)
-
-        # Batch semantic search
-        # Perform the semantic search for all entity embeddings at once
-        syntax_candidate_ids_batch = util.semantic_search(entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
-        # Process the results of the semantic search
+    def collate_fn_train(batch, entity_embeddings, context_embeddings, syntax_candidates_list, device='cuda'):
+        batch_context_embeddings = []
+        batch_entity_embeddings = []
         candidate_ids_batch = []
         candidate_description_embeddings_batch = []
-        labels = []
-        valid_sample_indices = []
-        for i, (full_mention, item_id, syntax_candidate_ids) in enumerate(zip(full_mentions, item_ids, syntax_candidate_ids_batch)):
+        labels_batch = []
+        for i, data in enumerate(batch):
+            index, full_mention, item_id = data
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
             
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.95]
+            syntax_candidates = syntax_candidates_list[index]
 
-            # drop duplicates
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates if candidate_id['score'] > 0.95]
+
+            # Remove duplicates and limit to 8 candidates
             candidate_ids = list(set(candidate_ids))
 
-            candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
-
-            # pad the candidate_description_embeddings and candidate_ids to length 8
-            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
-
-            # pad candidate_ids with 0s
-            candidate_ids += [0] * (8 - len(candidate_ids))
-
+            # do we have the ground truth in candidate_ids?
             try:
                 label = candidate_ids.index(item_id)
-                valid_sample_indices.append(i)
-            except:
-                label = 0
+            except ValueError:
+                # skip this sample
+                continue
 
+            candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
+            
+            # pad candidate_ids with 0s
+            candidate_ids += [0] * (8 - len(candidate_ids))
+            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
+            
+
+            batch_context_embeddings.append(context_embeddings[index])
+            batch_entity_embeddings.append(entity_embeddings[index])
             candidate_ids_batch.append(candidate_ids)
             candidate_description_embeddings_batch.append(candidate_description_embeddings)
-            labels.append(label)
 
-        # Filter the batch data based on valid_sample_indices
-        document_embed = document_embed[valid_sample_indices]
-        sentence_embeddings = sentence_embeddings[valid_sample_indices]
-        entity_embeddings = entity_embeddings[valid_sample_indices]
-        # print(f'{document_embed.shape}, {sentence_embeddings.shape}, {entity_embeddings.shape}')
-        candidate_ids_batch = [candidate_ids_batch[i] for i in valid_sample_indices]
-        candidate_description_embeddings_batch = [candidate_description_embeddings_batch[i] for i in valid_sample_indices]
-        labels = [labels[i] for i in valid_sample_indices]
+            labels_batch.append(label)
 
-        # convert to torch tensors
+        # labels is a list of integers, convert it to a tensor
+        labels_batch = torch.tensor(labels_batch, dtype=torch.long, device=device)
+        # batch_context_embeddings is a list of tensors thus we have to use stack
+        batch_context_embeddings = torch.stack(batch_context_embeddings)
+        batch_entity_embeddings = torch.stack(batch_entity_embeddings)
+        # candidate_ids_batch is a list of lists, convert it to a tensor
         candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
         candidate_description_embeddings_batch = torch.tensor(candidate_description_embeddings_batch, dtype=torch.float32, device=device)
-        labels = torch.tensor(labels, dtype=torch.long, device=device)
-        # print(f'{candidate_ids_batch.shape}, {candidate_description_embeddings_batch.shape}, {labels.shape}')
 
-        return document_embed, sentence_embeddings, entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch, labels
+        # move everything to device
+        batch_context_embeddings = batch_context_embeddings.to(device)
+        batch_entity_embeddings = batch_entity_embeddings.to(device)
+        candidate_ids_batch = candidate_ids_batch.to(device)
+        candidate_description_embeddings_batch = candidate_description_embeddings_batch.to(device)
+        labels_batch = labels_batch.to(device)
+
+        return batch_context_embeddings, batch_entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch, labels_batch
 
     @staticmethod
-    def collate_fn_test(batch, device='cuda'):
-        # Unpack the batch data
-        document_embed, sentence_embeddings, entity_embeddings, full_mentions = zip(*batch)
-
-        # Convert to torch tensors
-        sentence_embeddings = torch.tensor(sentence_embeddings, dtype=torch.float32, device=device)
-        entity_embeddings = torch.tensor(entity_embeddings, dtype=torch.float32, device=device)
-        document_embed = torch.tensor(document_embed, dtype=torch.float32, device=device)
-
-        # Batch semantic search
-        # Perform the semantic search for all entity embeddings at once
-        syntax_candidate_ids_batch = util.semantic_search(entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
-        # Process the results of the semantic search
+    def collate_fn_test(batch, entity_embeddings, context_embeddings, syntax_candidates_list, device='cuda'):
+        batch_context_embeddings = []
+        batch_entity_embeddings = []
         candidate_ids_batch = []
         candidate_description_embeddings_batch = []
-
-        for i, (full_mention, syntax_candidate_ids) in enumerate(zip(full_mentions, syntax_candidate_ids_batch)):
+        for i, data in enumerate(batch):
+            index, full_mention = data
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
+            
+            syntax_candidates = syntax_candidates_list[index]
 
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidate_ids if candidate_id['score'] > 0.95] 
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates if candidate_id['score'] > 0.95]
 
-            # drop duplicates
+            # Remove duplicates and limit to 8 candidates
             candidate_ids = list(set(candidate_ids))
 
             candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
-
-            # pad the candidate_description_embeddings and candidate_ids to length 8
-            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
-
+            
             # pad candidate_ids with 0s
             candidate_ids += [0] * (8 - len(candidate_ids))
+            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
+            
 
+            batch_context_embeddings.append(context_embeddings[index])
+            batch_entity_embeddings.append(entity_embeddings[index])
             candidate_ids_batch.append(candidate_ids)
             candidate_description_embeddings_batch.append(candidate_description_embeddings)
 
-        # convert to torch tensors
+        # batch_context_embeddings is a list of tensors thus we have to use stack
+        batch_context_embeddings = torch.stack(batch_context_embeddings)
+        batch_entity_embeddings = torch.stack(batch_entity_embeddings)
+        # candidate_ids_batch is a list of lists, convert it to a tensor
         candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
         candidate_description_embeddings_batch = torch.tensor(candidate_description_embeddings_batch, dtype=torch.float32, device=device)
 
-        return document_embed, sentence_embeddings, entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch
+        # move everything to device
+        batch_context_embeddings = batch_context_embeddings.to(device)
+        batch_entity_embeddings = batch_entity_embeddings.to(device)
+        candidate_ids_batch = candidate_ids_batch.to(device)
+        candidate_description_embeddings_batch = candidate_description_embeddings_batch.to(device)
+
+        return batch_context_embeddings, batch_entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch
     
     # collate_fn is optional, but allows us to do custom batching
     @staticmethod
@@ -396,7 +321,7 @@ class EntityClassifier(torch.nn.Module):
         # Select the one with the highest probability
         super().__init__()
         self.sequential = torch.nn.Sequential(
-            torch.nn.Linear(384 * 4, 384),
+            torch.nn.Linear(384 * 3, 384),
             torch.nn.ReLU(),
             torch.nn.Dropout(0.3),
             torch.nn.Linear(384, 1)
@@ -405,24 +330,22 @@ class EntityClassifier(torch.nn.Module):
         self.to(device)
 
     def forward(self, x):
-        document_embeds, sentence_embeddings, entity_embeddings, candidate_ids, candidate_description_embeddings = x
+        batch_context_embeddings, batch_entity_embeddings, candidate_ids_batch, candidate_description_embeddings_batch = x
         # The shapes are:
-        # sentence_embeddings: (batch_size, 384)
-        # entity_embeddings: (batch_size, 384)
-        # candidate_ids: (batch_size, 5)
-        # candidate_description_embeddings: (batch_size, 5, 384)
-        # labels: (batch_size,)
-        sentence_document_embed = torch.cat((sentence_embeddings, document_embeds), dim=1).to(self.device)
-        sentence_document_entity_embed = torch.cat((sentence_document_embed, entity_embeddings), dim=1).to(self.device)
-        # The shape of sentence_document_entity_embed is (batch_size, 384 * 3)
+        # batch_context_embeddings: (batch_size, 384)
+        # batch_entity_embeddings: (batch_size, 384)
+        # candidate_ids_batch: (batch_size, 8)
+        # candidate_description_embeddings_batch: (batch_size, 8, 384)
+        context_entity_embed = torch.cat((batch_context_embeddings, batch_entity_embeddings), dim=1).to(self.device)
+        # The shape of context_entity_embed is (batch_size, 384 * 2)
 
-        candidate_preds = torch.zeros(candidate_ids.shape[0], candidate_ids.shape[1], dtype=torch.float32, device=self.device)
-        for i in range(candidate_ids.shape[1]):
+        candidate_preds = torch.zeros((candidate_ids_batch.shape[0], candidate_ids_batch.shape[1]), device=self.device)
+        for i in range(candidate_ids_batch.shape[1]):
             # Get the current candidate of all the batches
-            candidate_description_embed = candidate_description_embeddings[:,i,:]
+            candidate_description_embed = candidate_description_embeddings_batch[:,i,:]
             # The shape of candidate_description_embed is (batch_size, 384)
             # Concatenate the sentence_document_entity_embed and candidate_description_embed
-            candidate_embed = torch.cat((sentence_document_entity_embed, candidate_description_embed), dim=1)
+            candidate_embed = torch.cat((context_entity_embed, candidate_description_embed), dim=1)
             # The shape of candidate_embed is (batch_size, 384 * 3)
             # Pass it through the sequential layer
             candidate_pred = self.sequential(candidate_embed)
@@ -432,3 +355,11 @@ class EntityClassifier(torch.nn.Module):
         return candidate_preds
 
         
+def delete_corpus_embeds():
+    global corpus_embeddings
+    logger.log('Deleting corpus embeddings...')
+    # Move it to cpu
+    # corpus_embeddings = corpus_embeddings.to('cpu')
+    # Delete it
+    del corpus_embeddings
+    torch.cuda.empty_cache()
