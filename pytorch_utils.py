@@ -207,17 +207,19 @@ class EntityDataset(Dataset):
                 continue
 
             # Concatenate all candidate texts, separated by [SEP]
-            candidate_texts = " ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
+            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
 
             # Pad with empty candidates if less than 8
             for _ in range(8 - len(candidate_ids)):
-                candidate_texts += f" {SPECIAL_TOKENS['candidate_token']} [PAD]"
+                candidate_texts +=  f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
 
             # Concatenate context, mention, and all candidate texts
-            input_text = f"{SPECIAL_TOKENS['context_token']} {context} {SPECIAL_TOKENS['mention_token']} {full_mention} {candidate_texts}"
+            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
             inputs.append(input_text)
             labels.append(label)
-
+        # if labels is empty, return None
+        if len(labels) == 0:
+            return None, None, None
         # Tokenize all inputs
         tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
 
@@ -231,6 +233,49 @@ class EntityDataset(Dataset):
 
         return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, labels
 
+    @staticmethod
+    def collate_fn_test(batch, syntax_candidates_list, device='cuda'):
+        inputs = []
+        candidate_ids_batch = []
+        for i, data in enumerate(batch):
+            context, index, full_mention = data
+            if full_mention in anchor_to_candidate:
+                candidate_ids = anchor_to_candidate[full_mention].copy()
+            else:
+                candidate_ids = []
+
+            syntax_candidates = syntax_candidates_list[index]
+
+            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates]
+
+            # Remove duplicates and limit to 8 candidates
+            candidate_ids = list(set(candidate_ids))[:8]
+
+            # Concatenate all candidate texts, separated by [SEP]
+            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
+
+            # Pad with empty candidates if less than 8
+            for _ in range(8 - len(candidate_ids)):
+                candidate_texts += f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
+
+            # pad the candidate ids
+            candidate_ids = candidate_ids + [0] * (8 - len(candidate_ids))
+
+            # Concatenate context, mention, and all candidate texts
+            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
+            inputs.append(input_text)
+
+            candidate_ids_batch.append(candidate_ids)
+
+        # Tokenize all inputs
+        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+
+        # Move tokenized inputs to device
+        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
+        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
+        # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
+        candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
+        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, candidate_ids_batch
 
 
 class EntityClassifier(torch.nn.Module):
@@ -241,7 +286,6 @@ class EntityClassifier(torch.nn.Module):
         self.classifier = torch.nn.Sequential(
             torch.nn.Linear(self.transformer.config.hidden_size, hidden_size),
             torch.nn.ReLU(),
-            torch.nn.Dropout(0.3),
             torch.nn.Linear(hidden_size, num_candidates)  # Output is a score for each candidate
         )
         self.num_candidates = num_candidates
