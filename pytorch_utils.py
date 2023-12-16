@@ -1,5 +1,8 @@
 # Torch Dataset definition
+from ast import List
 from pydoc import doc
+import stat
+import string
 from torch.utils.data import Dataset
 import pandas as pd
 from sentence_transformers import SentenceTransformer, util
@@ -24,7 +27,7 @@ SPECIAL_TOKENS = {
     "mention_token": "<mention>"
 }
 # Add special tokens to tokenizer
-tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.values())})
+# tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.values())})
 
 def update_full_mentions(df):
     # Define a function to get the longest full_mention
@@ -63,6 +66,10 @@ with open(DATA_DIR + 'pkl/anchor_to_candidate_new.pkl', 'rb') as handle:
 logger.log('Loading wikipedia title embedings...')
 with open(DATA_DIR + 'pkl/corpus_embeddings.pt', 'rb') as handle:
     corpus_embeddings = torch.load(handle, map_location=torch.device('cuda'))
+
+logger.log('Loading KB explanations...')
+with open(DATA_DIR + 'pkl/id_to_kb_explanation.pkl', 'rb') as handle:
+    kb_explanations = pickle.load(handle)
 
 logger.log('Loading wikipedia items...')
 wiki_items = pd.read_csv(DATA_DIR + 'wiki_lite/wiki_items.csv')
@@ -183,7 +190,8 @@ class EntityDataset(Dataset):
         
     @staticmethod
     def collate_fn_train(batch, syntax_candidates_list, device='cuda'):
-        inputs = []
+        tokenized_inputs_input_ids = []
+        tokenized_inputs_attention_mask = []
         labels = []
         for i, data in enumerate(batch):
             context, index, full_mention, item_id = data
@@ -206,37 +214,63 @@ class EntityDataset(Dataset):
                 # skip this sample
                 continue
 
-            # Concatenate all candidate texts, separated by [SEP]
-            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
+            kb_text = ""  # Initialize kb_text as an empty string
+            for candidate_id in candidate_ids:
+                candidate_text = f"{context} [SEP] {full_mention}"
+                if candidate_id in kb_explanations:
+                    kb_texts = kb_explanations[candidate_id] # List of strings
+                else:
+                    kb_texts = [id_to_description[candidate_id]['description']]
+                # while the total number of words of candidate_text and kb_texts is less than 512 or we still have kb_texts left we keep adding
+                for kb_text in kb_texts:
+                    # Check the token count before adding the next kb_text
+                    token_count = len(tokenizer.tokenize(candidate_text))
+                    kb_text_token_count = len(tokenizer.tokenize(kb_text))
+                    if token_count + kb_text_token_count + 1 > 512:  # +1 for the additional [SEP] token
+                        break  # Stop adding if the next kb_text will exceed the limit
+                    # Add the kb_text with a [SEP] token
+                    candidate_text += f" [SEP] {kb_text}"
+                
+                # Tokenize the candidate_text
+                tokenized_candidate_text = tokenizer(candidate_text, padding='max_length', truncation=True, return_tensors='pt', max_length=512)
+                # Add the tokenized candidate_text to the list
+                tokenized_inputs_input_ids.append(tokenized_candidate_text['input_ids'][0])
+                tokenized_inputs_attention_mask.append(tokenized_candidate_text['attention_mask'][0])
+                # If this is the correct candidate, label it as 1, otherwise label it as 0
+                labels.append(1 if candidate_id == item_id else 0)
 
-            # Pad with empty candidates if less than 8
-            for _ in range(8 - len(candidate_ids)):
-                candidate_texts +=  f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
+            num_candidates = len(candidate_ids)
+            num_padding_needed = 8 - num_candidates
+            if num_padding_needed > 0:
+                # Generate padding for input_ids and attention_mask
+                padding_input_ids = torch.zeros((num_padding_needed, 512), dtype=torch.long)
+                padding_attention_mask = torch.zeros((num_padding_needed, 512), dtype=torch.long)
+                # Append padding to the tokenized inputs
+                tokenized_inputs_input_ids.extend(padding_input_ids)
+                tokenized_inputs_attention_mask.extend(padding_attention_mask)
+                # Append 0's to the labels to indicate these are padding (not real candidates)
+                labels.extend([0] * num_padding_needed)
+            
 
-            # Concatenate context, mention, and all candidate texts
-            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
-            inputs.append(input_text)
-            labels.append(label)
         # if labels is empty, return None
         if len(labels) == 0:
             return None, None, None
         # Tokenize all inputs
-        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
 
         # Convert labels to tensor
-        labels = torch.tensor(labels, dtype=torch.long, device=device)
+        labels = torch.tensor(labels, dtype=torch.float, device=device)
 
         # Move tokenized inputs to device
-        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
-        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
+        tokenized_inputs_input_ids = torch.stack(tokenized_inputs_input_ids).to(device)
+        tokenized_inputs_attention_mask = torch.stack(tokenized_inputs_attention_mask).to(device)
         # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
 
         return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, labels
 
     @staticmethod
     def collate_fn_test(batch, syntax_candidates_list, device='cuda'):
-        inputs = []
-        candidate_ids_batch = []
+        tokenized_inputs_input_ids = []
+        tokenized_inputs_attention_mask = []
         for i, data in enumerate(batch):
             context, index, full_mention = data
             if full_mention in anchor_to_candidate:
@@ -251,42 +285,55 @@ class EntityDataset(Dataset):
             # Remove duplicates and limit to 8 candidates
             candidate_ids = list(set(candidate_ids))[:8]
 
-            # Concatenate all candidate texts, separated by [SEP]
-            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
+            kb_text = ""  # Initialize kb_text as an empty string
+            for candidate_id in candidate_ids:
+                candidate_text = f"{context} [SEP] {full_mention}"
+                kb_texts = kb_explanations[candidate_id] # List of strings
+                # while the total number of words of candidate_text and kb_texts is less than 512 or we still have kb_texts left we keep adding
+                for kb_text in kb_texts:
+                    # Check the token count before adding the next kb_text
+                    token_count = len(tokenizer.tokenize(candidate_text))
+                    kb_text_token_count = len(tokenizer.tokenize(kb_text))
+                    if token_count + kb_text_token_count + 1 > 512:  # +1 for the additional [SEP] token
+                        break  # Stop adding if the next kb_text will exceed the limit
+                    # Add the kb_text with a [SEP] token
+                    candidate_text += f" [SEP] {kb_text}"
+                
+                # Tokenize the candidate_text
+                tokenized_candidate_text = tokenizer(candidate_text, padding='max_length', truncation=True, return_tensors='pt', max_length=512)
+                # Add the tokenized candidate_text to the list
+                tokenized_inputs_input_ids.append(tokenized_candidate_text['input_ids'][0])
+                tokenized_inputs_attention_mask.append(tokenized_candidate_text['attention_mask'][0])
+                # If this is the correct candidate, label it as 1, otherwise label it as 0
 
-            # Pad with empty candidates if less than 8
-            for _ in range(8 - len(candidate_ids)):
-                candidate_texts += f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
-
-            # pad the candidate ids
-            candidate_ids = candidate_ids + [0] * (8 - len(candidate_ids))
-
-            # Concatenate context, mention, and all candidate texts
-            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
-            inputs.append(input_text)
-
-            candidate_ids_batch.append(candidate_ids)
-
-        # Tokenize all inputs
-        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+            num_candidates = len(candidate_ids)
+            num_padding_needed = 8 - num_candidates
+            if num_padding_needed > 0:
+                # Generate padding for input_ids and attention_mask
+                padding_input_ids = torch.zeros((num_padding_needed, 512), dtype=torch.long)
+                padding_attention_mask = torch.zeros((num_padding_needed, 512), dtype=torch.long)
+                # Append padding to the tokenized inputs
+                tokenized_inputs_input_ids.extend(padding_input_ids)
+                tokenized_inputs_attention_mask.extend(padding_attention_mask)
+                # Append 0's to the labels to indicate these are padding (not real candidates)
+            
 
         # Move tokenized inputs to device
-        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
-        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
+        tokenized_inputs_input_ids = torch.stack(tokenized_inputs_input_ids).to(device)
+        tokenized_inputs_attention_mask = torch.stack(tokenized_inputs_attention_mask).to(device)
         # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
-        candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
-        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, candidate_ids_batch
+
+        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask,
 
 
 class EntityClassifier(torch.nn.Module):
     def __init__(self, transformer_model, hidden_size, num_candidates=8, device='cuda'):
         super().__init__()
         self.transformer = DistilBertModel.from_pretrained(transformer_model)
-        self.transformer.resize_token_embeddings(len(tokenizer))
         self.classifier = torch.nn.Sequential(
             torch.nn.Linear(self.transformer.config.hidden_size, hidden_size),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, num_candidates)  # Output is a score for each candidate
+            torch.nn.Linear(hidden_size, 1)  # Output is a score for each candidate
         )
         self.num_candidates = num_candidates
         self.device = device
