@@ -27,10 +27,13 @@ def update_full_mentions(df):
     # Reset index to turn the group identifiers into columns
     longest_mentions.reset_index(drop=True, inplace=True)
 
+    longest_mentions.rename(columns={"full_mention": "full_mention_longest"}, inplace=True)
+
     # Merge the longest mentions back into the original DataFrame
     # This step will replace the full_mention in the original DataFrame
-    df = df.drop('full_mention', axis=1).merge(longest_mentions[['doc_id', 'token', 'full_mention']], on=['doc_id', 'token'], how='left')
-
+    #df = df.drop('full_mention', axis=1).merge(longest_mentions[['doc_id', 'token', 'full_mention']], on=['doc_id', 'token'], how='left')
+    
+    df = df.merge(longest_mentions[['doc_id', 'token', 'full_mention_longest']], on=['doc_id', 'token'], how='left')
     return df
 
 class Logger:
@@ -168,10 +171,12 @@ class EntityDataset(Dataset):
     def __getitem__(self, index):
         row = self.entity_df.iloc[index]
         full_mention = row['full_mention'].strip().lower()
+        full_mention_longest = row['full_mention_longest'].strip().lower()
+
         if self.train:
-            return index, full_mention, row['item_id']
+            return index, full_mention, full_mention_longest, row['item_id']
         else:
-            return index, full_mention
+            return index, full_mention, full_mention_longest
 
         
     @staticmethod
@@ -182,11 +187,14 @@ class EntityDataset(Dataset):
         candidate_description_embeddings_batch = []
         labels_batch = []
         for i, data in enumerate(batch):
-            index, full_mention, item_id = data
+            index, full_mention, full_mention_longest, item_id = data
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
+
+            if full_mention_longest in anchor_to_candidate:
+                candidate_ids += anchor_to_candidate[full_mention_longest].copy()
             
             syntax_candidates = syntax_candidates_list[index]
 
@@ -205,8 +213,8 @@ class EntityDataset(Dataset):
             candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
             
             # pad candidate_ids with 0s
-            candidate_ids += [0] * (8 - len(candidate_ids))
-            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
+            candidate_ids += [0] * (13 - len(candidate_ids))
+            candidate_description_embeddings += [np.zeros(384)] * (13 - len(candidate_description_embeddings))
             
 
             batch_context_embeddings.append(context_embeddings[index])
@@ -244,11 +252,14 @@ class EntityDataset(Dataset):
         candidate_ids_batch = []
         candidate_description_embeddings_batch = []
         for i, data in enumerate(batch):
-            index, full_mention = data
+            index, full_mention, full_mention_longest = data
             if full_mention in anchor_to_candidate:
                 candidate_ids = anchor_to_candidate[full_mention].copy()
             else:
                 candidate_ids = []
+
+            if full_mention_longest in anchor_to_candidate:
+                candidate_ids += anchor_to_candidate[full_mention_longest].copy()    
             
             syntax_candidates = syntax_candidates_list[index]
 
@@ -260,8 +271,8 @@ class EntityDataset(Dataset):
             candidate_description_embeddings = [statement_embeddings[statement_item_id_to_row[candidate_id]] if candidate_id in statement_item_id_to_row else description_embeddings[description_item_id_to_row[candidate_id]] for candidate_id in candidate_ids]
             
             # pad candidate_ids with 0s
-            candidate_ids += [0] * (8 - len(candidate_ids))
-            candidate_description_embeddings += [np.zeros(384)] * (8 - len(candidate_description_embeddings))
+            candidate_ids += [0] * (13 - len(candidate_ids))
+            candidate_description_embeddings += [np.zeros(384)] * (13 - len(candidate_description_embeddings))
             
 
             batch_context_embeddings.append(context_embeddings[index])
