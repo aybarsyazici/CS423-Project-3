@@ -1,5 +1,11 @@
 # Torch Dataset definition
+from ast import List
+from calendar import c
 from pydoc import doc
+import stat
+import string
+import tokenize
+from typing import Type
 from torch.utils.data import Dataset
 import pandas as pd
 from sentence_transformers import SentenceTransformer, util
@@ -24,7 +30,7 @@ SPECIAL_TOKENS = {
     "mention_token": "<mention>"
 }
 # Add special tokens to tokenizer
-tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.values())})
+# tokenizer.add_special_tokens({'additional_special_tokens': list(SPECIAL_TOKENS.values())})
 
 def update_full_mentions(df):
     # Define a function to get the longest full_mention
@@ -63,6 +69,10 @@ with open(DATA_DIR + 'pkl/anchor_to_candidate_new.pkl', 'rb') as handle:
 logger.log('Loading wikipedia title embedings...')
 with open(DATA_DIR + 'pkl/corpus_embeddings.pt', 'rb') as handle:
     corpus_embeddings = torch.load(handle, map_location=torch.device('cuda'))
+
+logger.log('Loading KB explanations...')
+with open(DATA_DIR + 'pkl/id_to_kb_explanation_joined.pkl', 'rb') as handle:
+    kb_explanations = pickle.load(handle)
 
 logger.log('Loading wikipedia items...')
 wiki_items = pd.read_csv(DATA_DIR + 'wiki_lite/wiki_items.csv')
@@ -103,6 +113,7 @@ class EntityDataset(Dataset):
         self.train_data['sentence_id'] = (self.train_data['token'] == '.').cumsum()
         self.train_data['doc_id'] = self.train_data['token'].str.startswith('-DOCSTART-').cumsum()
         self.train_data['full_mention'] = self.train_data['full_mention'].fillna('')
+        self.train_data['old_full_mention'] = self.train_data['full_mention']
         self.train_data = update_full_mentions(self.train_data)
         # Create a column called entity_loc that contains the location of the entity in the DOCUMENT
         # This is basically the word offset from the start of the document, to do this we can create a column that has
@@ -149,144 +160,218 @@ class EntityDataset(Dataset):
         self.entity_embeddings = self.model.encode(self.train_data[not_nan & not_nme]['full_mention'].to_list(), show_progress_bar=True, convert_to_tensor=True)
         print(f'Entity Length: {len(self.entity_embeddings)}')
         print(f'Entity shape: {self.entity_embeddings.shape}')
+        self.old_entity_embeddings = self.model.encode(self.train_data[not_nan & not_nme]['old_full_mention'].to_list(), show_progress_bar=True, convert_to_tensor=True)
         # move entity_embeddings to device
         logger.log(f'Now computing syntax candidates for each entity...')
         self.entity_embeddings = self.entity_embeddings.to(device)
         self.syntax_candidates = util.semantic_search(self.entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
+        logger.log(f'Now computing OLD syntax candidates for each entity...')
+        self.old_entity_embeddings = self.old_entity_embeddings.to(device)
+        self.old_syntax_candidates = util.semantic_search(self.old_entity_embeddings, corpus_embeddings, top_k=3, score_function=util.dot_score)
         # move entity_embeddings to cpu
         self.entity_embeddings = self.entity_embeddings.to('cpu')
-        # delete entity_embeddings
+        self.old_entity_embeddings = self.old_entity_embeddings.to('cpu')
+        # delete unnecessary variables
         del self.entity_embeddings
-        # delete all the unnecessary variables
+        del self.old_entity_embeddings
         del self.not_nan
         del self.not_nme
-        del not_nan
-        del not_nme
         del self.model
-        #del wiki_items_joined
-        #del pages
-        #del statements
+        del self.train_data
+        del self.train_data_no_doc_start
+        self.entity_df_indexes = []
+        self.candidate_ids = []
+        self.inputs = []
+        self.labels = []
+        # Now generating inputs and labels
+        logger.log(f'Now generating inputs and labels...')
+        exists = False
+        if train:
+            # does train_tokenized_inputs_attention_mask.pt and train_tokenized_inputs_input_ids.pt exist?
+            if os.path.exists(DATA_DIR + 'train_tokenized_inputs_attention_mask.pt') \
+                and os.path.exists(DATA_DIR + 'train_tokenized_inputs_input_ids.pt') \
+                and os.path.exists(DATA_DIR + 'train_entity_df_indexes.pkl') \
+                and os.path.exists(DATA_DIR + 'train_candidate_ids.pkl') \
+                and os.path.exists(DATA_DIR + 'train_labels.pkl'):
+                logger.log(f'Loading train_tokenized_inputs_attention_mask.pt and train_tokenized_inputs_input_ids.pt from data/pkl...')
+                self.tokenized_inputs_attention_mask = torch.load(DATA_DIR + 'train_tokenized_inputs_attention_mask.pt', map_location=torch.device('cpu'))
+                self.tokenized_inputs_input_ids = torch.load(DATA_DIR + 'train_tokenized_inputs_input_ids.pt', map_location=torch.device('cpu'))
+                with open(DATA_DIR + 'train_entity_df_indexes.pkl', 'rb') as handle:
+                    self.entity_df_indexes = pickle.load(handle)
+                with open(DATA_DIR + 'train_candidate_ids.pkl', 'rb') as handle:
+                    self.candidate_ids = pickle.load(handle)
+                with open(DATA_DIR + 'train_labels.pkl', 'rb') as handle:
+                    self.labels = pickle.load(handle)
+                exists = True
+            else:
+                for i in range(len(self.entity_df)):
+                    row = self.entity_df.iloc[i]
+                    full_mention = row['full_mention'].strip().lower()
+                    old_full_mention = row['old_full_mention'].strip().lower()
+                    candidate_ids = anchor_to_candidate.get(full_mention, []) + \
+                                    [wiki_items.iloc[candidate['corpus_id']]['item_id'] for candidate in self.syntax_candidates[i]]
+                    
+                    old_candidate_ids = anchor_to_candidate.get(old_full_mention, []) + \
+                                    [wiki_items.iloc[candidate['corpus_id']]['item_id'] for candidate in self.old_syntax_candidates[i]]
+                    
+                    candidate_ids = list(set(candidate_ids + old_candidate_ids))
+                    if row['item_id'] not in candidate_ids:
+                        continue  # Skip this sample if ground truth not in candidates
+
+                    item_id = row['item_id']
+                    
+                    for candidate_id in candidate_ids:
+                        kb_texts = kb_explanations.get(candidate_id, id_to_description[candidate_id]['description'])
+                        # # Limit length of kb_texts to 200 tokens
+                        # kb_text_word_scale = kb_texts.split(' ')
+                        # if len(kb_text_word_scale) > 200:
+                        #     kb_text_word_scale = kb_text_word_scale[:200]
+                        # kb_texts = ' '.join(kb_text_word_scale)
+                        candidate_text = f"{self.context_text[i]} [SEP] {full_mention} [SEP] {kb_texts}"
+                        self.inputs.append(candidate_text)
+                        self.labels.append(1 if candidate_id == item_id else 0)
+                        self.candidate_ids.append(candidate_id)
+                        self.entity_df_indexes.append(i)
+        else:
+            # does test_tokenized_inputs_attention_mask.pt and test_tokenized_inputs_input_ids.pt exist?
+            if os.path.exists(DATA_DIR + 'test_tokenized_inputs_attention_mask.pt') \
+                and os.path.exists(DATA_DIR + 'test_tokenized_inputs_input_ids.pt') \
+                and os.path.exists(DATA_DIR + 'test_entity_df_indexes.pkl') \
+                and os.path.exists(DATA_DIR + 'test_candidate_ids.pkl'):
+                logger.log(f'Loading test_tokenized_inputs_attention_mask.pt and test_tokenized_inputs_input_ids.pt from data/pkl...')
+                self.tokenized_inputs_attention_mask = torch.load(DATA_DIR + 'test_tokenized_inputs_attention_mask.pt', map_location=torch.device('cpu'))
+                self.tokenized_inputs_input_ids = torch.load(DATA_DIR + 'test_tokenized_inputs_input_ids.pt', map_location=torch.device('cpu'))
+                with open(DATA_DIR + 'test_entity_df_indexes.pkl', 'rb') as handle:
+                    self.entity_df_indexes = pickle.load(handle)
+                with open(DATA_DIR + 'test_candidate_ids.pkl', 'rb') as handle:
+                    self.candidate_ids = pickle.load(handle)
+                exists = True
+            else:
+                for i in range(len(self.entity_df)):
+                    row = self.entity_df.iloc[i]
+                    full_mention = row['full_mention'].strip().lower()
+                    old_full_mention = row['old_full_mention'].strip().lower()
+                    candidate_ids = anchor_to_candidate.get(full_mention, []) + \
+                                    [wiki_items.iloc[candidate['corpus_id']]['item_id'] for candidate in self.syntax_candidates[i] if candidate['score'] > 0.95]
+                    
+                    old_candidate_ids = anchor_to_candidate.get(old_full_mention, []) + \
+                                    [wiki_items.iloc[candidate['corpus_id']]['item_id'] for candidate in self.old_syntax_candidates[i] if candidate['score'] > 0.95]
+                    
+                    candidate_ids = list(set(candidate_ids + old_candidate_ids))
+
+                    for candidate_id in candidate_ids:
+                        kb_texts = kb_explanations.get(candidate_id, id_to_description[candidate_id]['description'])
+                        # # Limit length of kb_texts to 200 tokens
+                        # kb_text_word_scale = kb_texts.split(' ')
+                        # if len(kb_text_word_scale) > 200:
+                        #     kb_text_word_scale = kb_text_word_scale[:200]
+                        # kb_texts = ' '.join(kb_text_word_scale)
+                        candidate_text = f"{self.context_text[i]} [SEP] {full_mention} [SEP] {kb_texts}"
+                        self.inputs.append(candidate_text)
+                        self.entity_df_indexes.append(i)
+                        self.candidate_ids.append(candidate_id)
+
+        del self.context_text
+        del self.syntax_candidates
+        del self.old_syntax_candidates
+        
+        # Tokenize
+        if not exists:
+            logger.log(f'Now tokenizing...')
+            tokenized_inputs = tokenizer(self.inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+            self.tokenized_inputs_input_ids = tokenized_inputs['input_ids']
+            self.tokenized_inputs_attention_mask = tokenized_inputs['attention_mask']
+
+            # save tokenized_inputs_input_ids and tokenized_inputs_attention_mask and entity_df_indexes
+            torch.save(self.tokenized_inputs_input_ids, DATA_DIR + f'{set_type}_tokenized_inputs_input_ids.pt')
+            torch.save(self.tokenized_inputs_attention_mask, DATA_DIR + f'{set_type}_tokenized_inputs_attention_mask.pt')
+            with open(DATA_DIR + f'{set_type}_entity_df_indexes.pkl', 'wb') as handle:
+                pickle.dump(self.entity_df_indexes, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            with open(DATA_DIR + f'{set_type}_candidate_ids.pkl', 'wb') as handle:
+                pickle.dump(self.candidate_ids, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            
+            if train:
+                with open(DATA_DIR + f'{set_type}_labels.pkl', 'wb') as handle:
+                    pickle.dump(self.labels, handle, protocol=pickle.HIGHEST_PROTOCOL)
+                
+
+
+        del self.inputs
+
+
 
 
     def __len__(self):
         # Find the number of rows that have wiki_url not NaN or --NME--
-        return len(self.entity_df)
+        return len(self.entity_df_indexes)
     
     def __getitem__(self, index):
-        row = self.entity_df.iloc[index]
-        context = self.context_text[index]
-        full_mention = row['full_mention'].strip().lower()
+        tokenized_inputs_input_ids = self.tokenized_inputs_input_ids[index]
+        tokenized_inputs_attention_mask = self.tokenized_inputs_attention_mask[index]
+        entity_df_index = self.entity_df_indexes[index]
+        candidate_ids = self.candidate_ids[index]
         if self.train:
-            return context, index, full_mention, row['item_id']
+            label = self.labels[index]
+            return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, entity_df_index, label
         else:
-            return context, index, full_mention
+            return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, entity_df_index, candidate_ids
+
         
     @staticmethod
-    def collate_fn_train(batch, syntax_candidates_list, device='cuda'):
-        inputs = []
+    def collate_fn_train(batch, device=torch.device('cuda')):
+        tokenized_input_id_batch = []
+        tokenized_attention_mask_batch = []
+        indexes = []
         labels = []
         for i, data in enumerate(batch):
-            context, index, full_mention, item_id = data
-            if full_mention in anchor_to_candidate:
-                candidate_ids = anchor_to_candidate[full_mention].copy()
-            else:
-                candidate_ids = []
-
-            syntax_candidates = syntax_candidates_list[index]
-
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates]
-
-            # Remove duplicates and limit to 8 candidates
-            candidate_ids = list(set(candidate_ids))[:8]
-
-            # do we have the ground truth in candidate_ids?
-            try:
-                label = candidate_ids.index(item_id)
-            except ValueError:
-                # skip this sample
-                continue
-
-            # Concatenate all candidate texts, separated by [SEP]
-            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
-
-            # Pad with empty candidates if less than 8
-            for _ in range(8 - len(candidate_ids)):
-                candidate_texts +=  f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
-
-            # Concatenate context, mention, and all candidate texts
-            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
-            inputs.append(input_text)
+            tokenized_inputs_input_ids, tokenized_inputs_attention_mask, index, label = data
+            tokenized_input_id_batch.append(tokenized_inputs_input_ids)
+            tokenized_attention_mask_batch.append(tokenized_inputs_attention_mask)
+            indexes.append(index)
             labels.append(label)
-        # if labels is empty, return None
-        if len(labels) == 0:
-            return None, None, None
-        # Tokenize all inputs
-        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
+        
+        # No need to pad
+        tokenized_input_id_batch = torch.stack(tokenized_input_id_batch).to(device)
+        tokenized_attention_mask_batch = torch.stack(tokenized_attention_mask_batch).to(device)
+        indexes = torch.tensor(indexes, dtype=torch.long, device=device)
+        labels = torch.tensor(labels, dtype=torch.float, device=device)
 
-        # Convert labels to tensor
-        labels = torch.tensor(labels, dtype=torch.long, device=device)
+        return tokenized_input_id_batch, tokenized_attention_mask_batch, indexes, labels
 
-        # Move tokenized inputs to device
-        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
-        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
-        # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
+        
 
-        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, labels
-
+    
     @staticmethod
-    def collate_fn_test(batch, syntax_candidates_list, device='cuda'):
-        inputs = []
+    def collate_fn_test(batch, device=torch.device('cuda')):
+        tokenized_input_id_batch = []
+        tokenized_attention_mask_batch = []
+        indexes = []
         candidate_ids_batch = []
         for i, data in enumerate(batch):
-            context, index, full_mention = data
-            if full_mention in anchor_to_candidate:
-                candidate_ids = anchor_to_candidate[full_mention].copy()
-            else:
-                candidate_ids = []
-
-            syntax_candidates = syntax_candidates_list[index]
-
-            candidate_ids += [wiki_items.iloc[candidate_id['corpus_id']]['item_id'] for candidate_id in syntax_candidates]
-
-            # Remove duplicates and limit to 8 candidates
-            candidate_ids = list(set(candidate_ids))[:8]
-
-            # Concatenate all candidate texts, separated by [SEP]
-            candidate_texts = " [SEP] ".join([f"{SPECIAL_TOKENS['candidate_token']} {id_to_description[cid]['description']}" for cid in candidate_ids])
-
-            # Pad with empty candidates if less than 8
-            for _ in range(8 - len(candidate_ids)):
-                candidate_texts += f" [SEP] {SPECIAL_TOKENS['candidate_token']} [PAD]"
-
-            # pad the candidate ids
-            candidate_ids = candidate_ids + [0] * (8 - len(candidate_ids))
-
-            # Concatenate context, mention, and all candidate texts
-            input_text = f"{SPECIAL_TOKENS['context_token']} {context} [SEP] {SPECIAL_TOKENS['mention_token']} {full_mention} [SEP] {candidate_texts}"
-            inputs.append(input_text)
-
+            tokenized_inputs_input_ids, tokenized_inputs_attention_mask, index, candidate_ids = data
+            tokenized_input_id_batch.append(tokenized_inputs_input_ids)
+            tokenized_attention_mask_batch.append(tokenized_inputs_attention_mask)
+            indexes.append(index)
             candidate_ids_batch.append(candidate_ids)
 
-        # Tokenize all inputs
-        tokenized_inputs = tokenizer(inputs, padding=True, truncation=True, return_tensors='pt', max_length=512)
-
-        # Move tokenized inputs to device
-        tokenized_inputs_input_ids = tokenized_inputs['input_ids'].to(device)
-        tokenized_inputs_attention_mask = tokenized_inputs['attention_mask'].to(device)
-        # tokenized_inputs_token_type_ids = tokenized_inputs['token_type_ids'].to(device)
+        # No need to pad
+        tokenized_input_id_batch = torch.stack(tokenized_input_id_batch).to(device)
+        tokenized_attention_mask_batch = torch.stack(tokenized_attention_mask_batch).to(device)
+        indexes = torch.tensor(indexes, dtype=torch.long, device=device)
         candidate_ids_batch = torch.tensor(candidate_ids_batch, dtype=torch.long, device=device)
-        return tokenized_inputs_input_ids, tokenized_inputs_attention_mask, candidate_ids_batch
+
+        return tokenized_input_id_batch, tokenized_attention_mask_batch, indexes, candidate_ids_batch
 
 
 class EntityClassifier(torch.nn.Module):
-    def __init__(self, transformer_model, hidden_size, num_candidates=8, device='cuda'):
+    def __init__(self, transformer_model, hidden_size, num_candidates=8, device=torch.device('cuda')):
         super().__init__()
         self.transformer = DistilBertModel.from_pretrained(transformer_model)
-        self.transformer.resize_token_embeddings(len(tokenizer))
         self.classifier = torch.nn.Sequential(
             torch.nn.Linear(self.transformer.config.hidden_size, hidden_size),
             torch.nn.ReLU(),
-            torch.nn.Linear(hidden_size, num_candidates)  # Output is a score for each candidate
+            torch.nn.Linear(hidden_size, 1)  # Output is a score for each candidate
         )
         self.num_candidates = num_candidates
         self.device = device
@@ -308,8 +393,6 @@ class EntityClassifier(torch.nn.Module):
 def delete_corpus_embeds():
     global corpus_embeddings
     logger.log('Deleting corpus embeddings...')
-    # Move it to cpu
-    corpus_embeddings = corpus_embeddings.to('cpu')
     # Delete it
     del corpus_embeddings
     torch.cuda.empty_cache()
