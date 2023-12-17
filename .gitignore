@@ -10,7 +10,7 @@ data/wiki_lite
 data/*.pt
 data/*.pkl
 data/*.tsv
-./*.pt
+*.pt
 .venv/
 __pycache__/
 anchor_target_counts.csv
