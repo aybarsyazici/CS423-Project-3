@@ -7,6 +7,11 @@ data/pkl/*.pkl
 data/pkl/*.pt
 data/pkl/*.jsonl
 data/wiki_lite
+data/*.pt
+data/*.pkl
+data/*.tsv
+./*.pt
 .venv/
 __pycache__/
 anchor_target_counts.csv
+./.gitignore
